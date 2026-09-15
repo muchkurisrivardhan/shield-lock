@@ -125,6 +125,10 @@ static class Program
             }
             CheckWallpaper();
             Flush();
+            // Photos-app changes don't always raise UserPreferenceChanged, so also poll (cheap registry read)
+            var poll = new DispatcherTimer { Interval = TimeSpan.FromSeconds(5) };
+            poll.Tick += delegate { CheckWallpaper(); };
+            poll.Start();
 
             app.Run();
         }
@@ -142,7 +146,11 @@ static class Program
         currentWallpaperTime = stamp;
         Log("wallpaper: " + path);
         if (!startup) { welcomePending = true; Flush(); }
-        if (!File.Exists(RenderPath(path))) StartRender(path);
+        if (File.Exists(RenderPath(path))) return;
+        // render after the preview has finished so the two don't fight for the CPU
+        var later = new DispatcherTimer { Interval = TimeSpan.FromSeconds(startup ? 1 : Duration + 2) };
+        later.Tick += delegate { later.Stop(); StartRender(path); };
+        later.Start();
     }
 
     // Plays whatever is queued, one overlay at a time: intrusion alert first, then the welcome.
@@ -346,8 +354,12 @@ static class Program
     {
         Rect placed = WallpaperRect(bmp, W, H);
         var rnd = new Random((int)(hash ^ (hash >> 32)));
-        int effect = forcedEffect >= 0 ? forcedEffect : Hamming(hash, WallPaperHash) <= 4 ? 5 : (int)((hash ^ (hash >> 17) ^ (hash >> 41)) % 5);
+        int effect = forcedEffect >= 0 ? forcedEffect
+            : Hamming(hash, WallPaperHash) <= 4 ? 5
+            : Hamming(hash, ItachiHash) <= 4 ? 6
+            : (int)((hash ^ (hash >> 17) ^ (hash >> 41)) % 5);
         if (effect == 5) WallPaperScene(root, bmp, placed, sb);
+        else if (effect == 6) ItachiScene(root, bmp, placed, W, H, sb, rnd);
         else switch (effect)
         {
             case 0: Mosaic(root, bmp, placed, accent, sb, rnd); break;
@@ -537,6 +549,219 @@ static class Program
         Canvas.SetTop(tile, p.Y + v0 * p.Height);
         canvas.Children.Add(tile);
         return tile;
+    }
+
+    // --- "Itachi" bespoke scene: rain, then the eyes open ---------------------------------------
+    //   0.0s rain in the dark        1.0s / 2.6s lightning glimpses the face, eyes shut
+    //   1.8s face slowly surfaces    3.4s red light leaks between the lids
+    //   3.6s lids part, droop, then open fully by 6.0s     6.0s Sharingan flare: shockwave, picture lights up
+    //   6.6s name card               8.4s crossfade to the untouched picture
+    const ulong ItachiHash = 0x83c31230b0969697UL;
+
+    // Eye openings in the 3840x2160 picture, traced by hand from a zoomed grid: the outline the lids are
+    // clipped to, the two corners the closed lash line runs between, how far it sags, and the skin grey beside it.
+    sealed class EyeSpec { public string Outline; public Point Left, Right; public double Sag, Skin; }
+    static readonly EyeSpec[] ItachiEyes =
+    {
+        new EyeSpec { Outline = "1493,611 1550,612 1607,646 1651,675 1656,688 1629,707 1604,718 1580,724 1560,727 1540,725 1520,723 1506,721 1493,718",
+                      Left = new Point(1493, 692), Right = new Point(1656, 688), Sag = 10, Skin = 104 },
+        new EyeSpec { Outline = "2255,670 2280,653 2297,640 2317,621 2340,613 2370,613 2383,598 2410,593 2432,590 2434,676 2418,695 2390,709 2357,718 2327,719 2297,710 2270,695 2251,680",
+                      Left = new Point(2251, 677), Right = new Point(2434, 668), Sag = 13, Skin = 117 },
+    };
+
+    static void ItachiScene(Grid root, BitmapSource bmp, Rect p, double W, double H, Storyboard sb, Random rnd)
+    {
+        double iw = bmp.PixelWidth, ih = bmp.PixelHeight;
+        Color red = Color.FromRgb(0xFF, 0x1A, 0x2E);
+        var easeOut = new CubicEase { EasingMode = EasingMode.EaseOut };
+        var outlines = ItachiEyes.Select(e => Geo("M " + e.Outline.Replace(" ", " L ") + " Z")).ToArray();
+        double midX = (outlines[0].Bounds.Left + outlines[1].Bounds.Right) / 2 / iw, midY = (outlines[0].Bounds.Top + outlines[1].Bounds.Bottom) / 2 / ih;
+
+        // camera: creeps toward the eyes while they open, punches on the flare, then settles to 1:1
+        var cam = new Grid { RenderTransformOrigin = new Point((p.X + midX * p.Width) / W, (p.Y + midY * p.Height) / H), RenderTransform = new ScaleTransform(1.16, 1.16) };
+        root.Children.Add(cam);
+        foreach (string axis in new[] { "ScaleX", "ScaleY" })
+            AnimatePath(sb, cam, "RenderTransform." + axis, Mix(0, 1.16, 1, 5.95, 1.10, 3, 6.0, 1.14, 1, 8.4, 1.0, 2), null);
+
+        // the face and its eyelids dim and brighten together: black, two lightning glimpses, slow surfacing, full light on the flare
+        var face = new Grid();
+        cam.Children.Add(face);
+        face.Children.Add(Placed(bmp, p));
+        Canvas lids = PictureCanvas(p, iw);
+        face.Children.Add(lids);
+        Animate(sb, face, UIElement.OpacityProperty, Mix(0, 0, 1, 1.0, 0.75, 1, 1.07, 0.1, 1, 1.15, 0.5, 1, 1.28, 0, 1, 1.8, 0, 1,
+                                                        2.59, 0.22, 0, 2.6, 0.9, 1, 2.68, 0.25, 1, 3.4, 0.45, 0, 5.95, 0.55, 0, 6.0, 1, 1));
+
+        Canvas fx = PictureCanvas(p, iw); // glows and shockwaves stay bright over the dim face
+        cam.Children.Add(fx);
+
+        for (int n = 0; n < ItachiEyes.Length; n++)
+        {
+            EyeSpec e = ItachiEyes[n];
+            Rect box = outlines[n].Bounds;
+            double cx = box.X + box.Width / 2, cy = box.Y + box.Height / 2;
+            double ctrlX = (e.Left.X + e.Right.X) / 2, ctrlY = (e.Left.Y + e.Right.Y) / 2 + 2 * e.Sag, seamMid = (e.Left.Y + e.Right.Y) / 2 + e.Sag;
+            string seam = Fmt("{0},{1} Q {2},{3} {4},{5}", e.Left.X, e.Left.Y, ctrlX, ctrlY, e.Right.X, e.Right.Y);
+            double L = box.Left - 30, R = box.Right + 30, T = box.Top - 60, B = box.Bottom + 60;
+            byte skin = (byte)e.Skin, lowSkin = (byte)(e.Skin * 0.92), shadow = (byte)(e.Skin * 0.3);
+
+            // eyelids clipped to the traced opening: the upper one shades from the art's dark lid shadow to skin,
+            // carries the lash line and casts a soft shadow onto the eye as it lifts
+            var eye = new Canvas { Clip = outlines[n] };
+            lids.Children.Add(eye);
+            var lower = new System.Windows.Shapes.Path
+            {
+                Fill = new SolidColorBrush(Color.FromRgb(lowSkin, lowSkin, lowSkin)), RenderTransform = new TranslateTransform(),
+                Data = Geo("M {0},{1} L " + seam + " L {2},{3} L {2},{4} L {0},{4} Z", L, e.Left.Y, R, e.Right.Y, B)
+            };
+            var upper = new Canvas { RenderTransform = new TranslateTransform() };
+            upper.Children.Add(new System.Windows.Shapes.Path
+            {
+                Fill = new LinearGradientBrush(Color.FromRgb(shadow, shadow, shadow), Color.FromRgb(skin, skin, skin), new Point(0, box.Top), new Point(0, seamMid)) { MappingMode = BrushMappingMode.Absolute },
+                Data = Geo("M {0},{1} L " + seam + " L {2},{3} L {2},{4} L {0},{4} Z", L, e.Left.Y, R, e.Right.Y, T)
+            });
+            upper.Children.Add(new System.Windows.Shapes.Path
+            {
+                Stroke = Brushes.Black, StrokeThickness = 14, Opacity = 0.35,
+                Data = Geo("M {0},{1} Q {2},{3} {4},{5}", e.Left.X, e.Left.Y + 9, ctrlX, ctrlY + 9, e.Right.X, e.Right.Y + 9)
+            });
+            upper.Children.Add(new System.Windows.Shapes.Path
+            {
+                Stroke = Brushes.Black, StrokeThickness = 8, StrokeStartLineCap = PenLineCap.Round, StrokeEndLineCap = PenLineCap.Round,
+                Data = Geo("M " + seam)
+            });
+            eye.Children.Add(lower);
+            eye.Children.Add(upper);
+
+            // open slowly: crack, droop as if heavy, then all the way (lids end clear of the opening)
+            double up = seamMid + 16 - box.Top + 10, down = box.Bottom - Math.Min(e.Left.Y, e.Right.Y) + 10;
+            AnimatePath(sb, upper, "RenderTransform.Y", Mix(0, 0, 1, 3.6, 0, 1, 4.3, -0.22 * up, 2, 4.55, -0.12 * up, 3, 4.75, -0.12 * up, 0, 6.0, -up, 3), null);
+            AnimatePath(sb, lower, "RenderTransform.Y", Mix(0, 0, 1, 3.6, 0, 1, 4.3, 0.25 * down, 2, 4.55, 0.15 * down, 3, 4.75, 0.15 * down, 0, 6.0, down, 3), null);
+
+            // red light leaking along the shut lash line
+            var slit = new System.Windows.Shapes.Path
+            {
+                Stroke = new SolidColorBrush(red), StrokeThickness = 5, Opacity = 0, Data = Geo("M " + seam),
+                Effect = new DropShadowEffect { Color = red, BlurRadius = 35, ShadowDepth = 0 }
+            };
+            fx.Children.Add(slit);
+            Animate(sb, slit, UIElement.OpacityProperty, Keys(3.3, 0, 3.6, 1, 4.3, 0.8, 4.8, 0));
+
+            // glow that swells with the opening and flares when the eyes are fully open
+            double gr = box.Height * 2.4;
+            var glow = new Ellipse { Width = gr * 2, Height = gr * 2, Opacity = 0, Fill = new RadialGradientBrush(Color.FromArgb(150, red.R, red.G, red.B), Color.FromArgb(0, red.R, red.G, red.B)) };
+            Canvas.SetLeft(glow, cx - gr); Canvas.SetTop(glow, cy - gr);
+            fx.Children.Add(glow);
+            Animate(sb, glow, UIElement.OpacityProperty, Keys(3.5, 0, 4.3, 0.45, 4.55, 0.25, 4.75, 0.3, 5.95, 0.7, 6.05, 1, 6.5, 0.5, 7.2, 0.75, 7.9, 0.45, 8.6, 0));
+
+            // shockwave ring off each eye on the flare
+            var wave = new System.Windows.Shapes.Path
+            {
+                Stroke = new SolidColorBrush(red), StrokeThickness = 16, Opacity = 0, Data = new EllipseGeometry(new Point(cx, cy), 1, 1),
+                Effect = new DropShadowEffect { Color = red, BlurRadius = 40, ShadowDepth = 0 }
+            };
+            fx.Children.Add(wave);
+            AnimatePath(sb, wave, "Data.RadiusX", Keys(6.0, 1, 7.1, 2600), easeOut);
+            AnimatePath(sb, wave, "Data.RadiusY", Keys(6.0, 1, 7.1, 2600), easeOut);
+            Animate(sb, wave, UIElement.OpacityProperty, Keys(5.99, 0, 6.0, 1, 7.1, 0));
+            Animate(sb, wave, Shape.StrokeThicknessProperty, Keys(6.0, 16, 7.1, 2));
+        }
+
+        // rain: a far layer of fine slow streaks and a near layer of heavy fast ones, all the way through
+        foreach (Canvas layer in new[] { Rain(sb, rnd, W, H, 170, 1, 0.12, 0.3, 18, 45, 0.7, 1.0), Rain(sb, rnd, W, H, 55, 2, 0.35, 0.65, 60, 140, 0.32, 0.45) })
+        {
+            root.Children.Add(layer);
+            Animate(sb, layer, UIElement.OpacityProperty, Keys(0, 0, 0.6, 1, 8.3, 1, 9.0, 0));
+        }
+
+        // lightning (two close strikes, one distant rumble) and the red flash as the eyes lock open
+        var flash = new Rectangle { Fill = Brushes.White, Opacity = 0 };
+        root.Children.Add(flash);
+        Animate(sb, flash, UIElement.OpacityProperty, Steps(1.0, 0.7, 1.07, 0.1, 1.15, 0.45, 1.28, 0, 2.6, 0.8, 2.68, 0.15, 2.75, 0.3, 2.85, 0, 7.3, 0.12, 7.4, 0));
+        var redFlash = new Rectangle { Fill = new SolidColorBrush(red), Opacity = 0 };
+        root.Children.Add(redFlash);
+        Animate(sb, redFlash, UIElement.OpacityProperty, Mix(5.99, 0, 1, 6.0, 0.35, 1, 6.5, 0, 2));
+
+        // embers: red flecks drifting up after the flare
+        var embers = new Canvas();
+        root.Children.Add(embers);
+        for (int i = 0; i < 40; i++)
+        {
+            double size = 3 + rnd.NextDouble() * 4, t0 = 6.2 + rnd.NextDouble() * 1.2, dur = 1.4 + rnd.NextDouble() * 0.8;
+            var ember = new Ellipse { Width = size, Height = size, Fill = new SolidColorBrush(red), Opacity = 0, RenderTransform = new TranslateTransform() };
+            Canvas.SetLeft(ember, rnd.NextDouble() * W); Canvas.SetTop(ember, H * 0.45 + rnd.NextDouble() * H * 0.6);
+            embers.Children.Add(ember);
+            AnimatePath(sb, ember, "RenderTransform.Y", Keys(t0, 0, t0 + dur, -(150 + rnd.NextDouble() * 250)), easeOut);
+            AnimatePath(sb, ember, "RenderTransform.X", Keys(t0, 0, t0 + dur / 2, (rnd.NextDouble() - 0.5) * 60, t0 + dur, (rnd.NextDouble() - 0.5) * 60), null);
+            Animate(sb, ember, UIElement.OpacityProperty, Keys(t0, 0, t0 + 0.3, 0.9, t0 + dur - 0.3, 0.9, t0 + dur, 0));
+        }
+
+        // name card, bottom centre
+        var card = new StackPanel { HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Bottom, Margin = new Thickness(0, 0, 0, H * 0.09), Opacity = 0, RenderTransform = new TranslateTransform() };
+        card.Children.Add(new TextBlock { Text = "うちはイタチ", FontFamily = new FontFamily("Yu Gothic UI, Meiryo UI, Segoe UI"), FontSize = 20, Foreground = new SolidColorBrush(red), HorizontalAlignment = HorizontalAlignment.Center });
+        card.Children.Add(new TextBlock { Text = "I T A C H I   U C H I H A", FontFamily = new FontFamily("Segoe UI"), FontWeight = FontWeights.Light, FontSize = 36, Foreground = Brushes.White, Margin = new Thickness(0, 2, 0, 8) });
+        var rule = new Rectangle { Height = 2, Width = 260, Fill = new SolidColorBrush(red), RenderTransformOrigin = new Point(0.5, 0.5), RenderTransform = new ScaleTransform(0, 1) };
+        card.Children.Add(rule);
+        root.Children.Add(card);
+        Animate(sb, card, UIElement.OpacityProperty, Keys(6.6, 0, 7.1, 1, 8.0, 1, 8.4, 0));
+        AnimatePath(sb, card, "RenderTransform.Y", Keys(6.6, 24, 7.3, 0), easeOut);
+        AnimatePath(sb, rule, "RenderTransform.ScaleX", Keys(6.9, 0, 7.6, 1), easeOut);
+
+        // crossfade onto the untouched picture so the dissolve to the desktop is seamless
+        Image real = Placed(bmp, p);
+        real.Opacity = 0;
+        root.Children.Add(real);
+        Animate(sb, real, UIElement.OpacityProperty, Keys(8.4, 0, 9.0, 1));
+    }
+
+    // One layer of looping rain streaks, slanted by the wind. Drops start above the screen so none sit waiting at the top.
+    static Canvas Rain(Storyboard sb, Random rnd, double W, double H, int count, double thick, double o0, double o1, double l0, double l1, double s0, double s1)
+    {
+        var layer = new Canvas { Opacity = 0, RenderTransform = new SkewTransform(-8, 0) };
+        for (int i = 0; i < count; i++)
+        {
+            double len = l0 + rnd.NextDouble() * (l1 - l0), x = rnd.NextDouble() * W * 1.3 - W * 0.05, speed = s0 + rnd.NextDouble() * (s1 - s0);
+            var drop = new Line { X1 = x, X2 = x, Y1 = 0, Y2 = len, Stroke = Brushes.White, StrokeThickness = thick, Opacity = o0 + rnd.NextDouble() * (o1 - o0), RenderTransform = new TranslateTransform(0, -len - 10) };
+            layer.Children.Add(drop);
+            var fall = new DoubleAnimation(-len - 10, H + 10, TimeSpan.FromSeconds(speed)) { BeginTime = TimeSpan.FromSeconds(rnd.NextDouble() * speed), RepeatBehavior = RepeatBehavior.Forever };
+            Storyboard.SetTarget(fall, drop);
+            Storyboard.SetTargetProperty(fall, new PropertyPath("RenderTransform.Y"));
+            sb.Children.Add(fall);
+        }
+        return layer;
+    }
+
+    // A zero-size canvas whose coordinates are the picture's own pixels, mapped to where Windows draws it.
+    static Canvas PictureCanvas(Rect p, double iw)
+    {
+        double s = p.Width / iw;
+        var c = new Canvas { HorizontalAlignment = HorizontalAlignment.Left, VerticalAlignment = VerticalAlignment.Top };
+        var tg = new TransformGroup();
+        tg.Children.Add(new ScaleTransform(s, s));
+        tg.Children.Add(new TranslateTransform(p.X, p.Y));
+        c.RenderTransform = tg;
+        return c;
+    }
+
+    static string Fmt(string format, params object[] args) { return string.Format(CultureInfo.InvariantCulture, format, args); }
+    static Geometry Geo(string format, params object[] args) { return Geometry.Parse(Fmt(format, args)); }
+
+    // Keyframes from (time, value, kind) triples; kind 0 = linear, 1 = jump, 2 = ease out, 3 = ease in-out.
+    static DoubleAnimationUsingKeyFrames Mix(params double[] t)
+    {
+        var a = new DoubleAnimationUsingKeyFrames();
+        for (int i = 0; i < t.Length; i += 3)
+        {
+            KeyTime k = KeyTime.FromTimeSpan(TimeSpan.FromSeconds(t[i]));
+            switch ((int)t[i + 2])
+            {
+                case 1: a.KeyFrames.Add(new DiscreteDoubleKeyFrame(t[i + 1], k)); break;
+                case 2: a.KeyFrames.Add(new EasingDoubleKeyFrame(t[i + 1], k, new CubicEase { EasingMode = EasingMode.EaseOut })); break;
+                case 3: a.KeyFrames.Add(new EasingDoubleKeyFrame(t[i + 1], k, new SineEase { EasingMode = EasingMode.EaseInOut })); break;
+                default: a.KeyFrames.Add(new LinearDoubleKeyFrame(t[i + 1], k)); break;
+            }
+        }
+        return a;
     }
 
     // --- "Wall. Paper." bespoke scene -----------------------------------------------------------
