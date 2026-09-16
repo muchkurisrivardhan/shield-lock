@@ -35,7 +35,7 @@ Activity is logged to `shieldlock.log` next to the exe.
 The tray app only lives until the PC shuts down, so register it once:
 
 ```
-reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v ShieldLock /d "C:\path	o\ShieldLock.exe" /f
+reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v ShieldLock /d "C:\path\to\ShieldLock.exe" /f
 ```
 
 Remove it any time in Task Manager -> Startup apps. No admin needed.
