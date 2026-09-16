@@ -124,7 +124,10 @@ static class Program
                     using (r) pending.Add(r.TimeCreated ?? DateTime.Now);
             }
             CheckWallpaper();
-            Flush();
+            // At sign-in the shell is still painting; let the desktop settle before the intro plays over it.
+            var firstPlay = new DispatcherTimer { Interval = TimeSpan.FromSeconds(2.5) };
+            firstPlay.Tick += delegate { firstPlay.Stop(); Flush(); };
+            firstPlay.Start();
             // Photos-app changes don't always raise UserPreferenceChanged, so also poll (cheap registry read)
             var poll = new DispatcherTimer { Interval = TimeSpan.FromSeconds(5) };
             poll.Tick += delegate { CheckWallpaper(); };

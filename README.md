@@ -30,6 +30,16 @@ ShieldLock.exe --render         renders the current wallpaper's animation to ren
 Right-click the tray icon for *Test animation*, *Re-render wallpaper video*, *Open renders folder*.
 Activity is logged to `shieldlock.log` next to the exe.
 
+### Start at sign-in
+
+The tray app only lives until the PC shuts down, so register it once:
+
+```
+reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v ShieldLock /d "C:\path	o\ShieldLock.exe" /f
+```
+
+Remove it any time in Task Manager -> Startup apps. No admin needed.
+
 ## Files
 
 - `Program.cs` – everything: sign-in watcher, wallpaper detection, the five effects, video rendering, git push
